@@ -1,0 +1,110 @@
+name: Deploy to GCE VM (WIF Secure)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+      app:
+        description: "App folder"
+        required: true
+        default: "app1"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_ID_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Set GCP Project
+        run: gcloud config set project kxnwork
+
+      - name: Build artifact
+        run: |
+          APP="${{ github.event.inputs.app }}"
+          mkdir -p dist
+          cd "$APP"
+          npm ci
+          npm run build
+          cd ..
+          tar -czf "dist/${APP}.tar.gz" "$APP"
+
+      - name: Fetch secrets from Secret Manager
+        id: fetchsecrets
+        run: |
+          APP="${{ github.event.inputs.app }}"
+          ENV="${{ github.event.inputs.environment }}"
+          TMPDIR=$(mktemp -d)
+          ENVFILE="${TMPDIR}/${APP}.env"
+          touch "$ENVFILE"
+          chmod 600 "$ENVFILE"
+
+          declare -a PAIRS=(
+            "DATABASE_URL:myapp-DB-URL-${ENV}"
+            "JWT_SECRET:myapp-JWT-SECRET-${ENV}"
+            "API_KEY:myapp-API-KEY-${ENV}"
+          )
+
+          for p in "${PAIRS[@]}"; do
+            KEY="${p%%:*}"
+            SEC="${p##*:}"
+            VAL=$(gcloud secrets versions access latest --secret="$SEC" --format='get(payload.data)' | base64 -d)
+            echo "$KEY=\"$VAL\"" >> "$ENVFILE"
+          done
+
+          echo "envfile=$ENVFILE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to VM (IAP tunnel)
+        run: |
+          APP="${{ github.event.inputs.app }}"
+          VM="${{ secrets.TARGET_VM_NAME }}"
+          ZONE="${{ secrets.TARGET_VM_ZONE }}"
+          USER="${{ secrets.TARGET_VM_USER }}"
+          ENVFILE="${{ steps.fetchsecrets.outputs.envfile }}"
+
+          gcloud compute scp --tunnel-through-iap --zone="$ZONE" \
+            "dist/${APP}.tar.gz" "${USER}@${VM}:/tmp/${APP}.tar.gz"
+
+          gcloud compute scp --tunnel-through-iap --zone="$ZONE" \
+            "$ENVFILE" "${USER}@${VM}:/tmp/${APP}.env"
+
+      - name: Deploy on VM
+        run: |
+          APP="${{ github.event.inputs.app }}"
+          VM="${{ secrets.TARGET_VM_NAME }}"
+          ZONE="${{ secrets.TARGET_VM_ZONE }}"
+          USER="${{ secrets.TARGET_VM_USER }}"
+
+          CMD=$(cat <<EOF
+set -e
+TARGET="/opt/apps/${APP}"
+mkdir -p "\$TARGET"
+tar -xzf "/tmp/${APP}.tar.gz" -C "\$TARGET"
+mv "/tmp/${APP}.env" "\$TARGET/.env"
+chmod 600 "\$TARGET/.env"
+systemctl restart "${APP}.service" || true
+EOF
+)
+
+          gcloud compute ssh --tunnel-through-iap --zone="$ZONE" \
+            "${USER}@${VM}" --command="$CMD"
