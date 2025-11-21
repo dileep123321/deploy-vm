@@ -5,18 +5,19 @@ on:
     inputs:
       environment:
         type: choice
-        description: "Environment"
+        description: "Environment to deploy"
         required: true
         default: "dev"
         options:
           - dev
           - stage
           - prod
+
       app:
         type: string
-        description: "App folder"
-        default: "app1"
+        description: "App folder name"
         required: true
+        default: "app1"
 
 permissions:
   id-token: write
@@ -27,10 +28,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Authenticate with WIF
+      - name: Authenticate to Google Cloud (WIF)
         uses: google-github-actions/auth@v1
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_ID_PROVIDER }}
@@ -42,32 +43,37 @@ jobs:
 
       - name: Build artifact
         run: |
+          set -e
           APP="${{ github.event.inputs.app }}"
           mkdir -p dist
-          tar -czf dist/${APP}.tar.gz ${APP}
+          tar -czf "dist/${APP}.tar.gz" "${APP}"
 
-      - name: Upload to VM (IAP)
+      - name: Upload artifact to VM via IAP
         run: |
+          set -e
           APP="${{ github.event.inputs.app }}"
           VM="${{ secrets.TARGET_VM_NAME }}"
           ZONE="${{ secrets.TARGET_VM_ZONE }}"
           USER="${{ secrets.TARGET_VM_USER }}"
+
           gcloud compute scp \
-            dist/${APP}.tar.gz \
-            ${USER}@${VM}:/tmp/${APP}.tar.gz \
-            --zone="${ZONE}" --tunnel-through-iap
+            "dist/${APP}.tar.gz" \
+            "${USER}@${VM}:/tmp/${APP}.tar.gz" \
+            --zone="${ZONE}" --tunnel-through-iap --quiet
 
-      - name: Execute remote deploy
+      - name: Execute deploy on VM
         run: |
+          set -e
           APP="${{ github.event.inputs.app }}"
           VM="${{ secrets.TARGET_VM_NAME }}"
-          USER="${{ secrets.TARGET_VM_USER }}"
           ZONE="${{ secrets.TARGET_VM_ZONE }}"
+          USER="${{ secrets.TARGET_VM_USER }}"
 
           CMD="mkdir -p /opt/apps/${APP} && \
                tar -xzf /tmp/${APP}.tar.gz -C /opt/apps/${APP} && \
-               echo 'Deployed ${APP}'"
+               echo 'Deployment complete for ${APP}'"
 
-          gcloud compute ssh ${USER}@${VM} \
-            --zone=${ZONE} --tunnel-through-iap \
-            --command=\"${CMD}\"
+          gcloud compute ssh "${USER}@${VM}" \
+            --zone="${ZONE}" \
+            --tunnel-through-iap \
+            --command="${CMD}"
